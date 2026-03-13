@@ -47,29 +47,105 @@ end
 -- local log = require 'log'
 -- log.outfile = "aux_code.log"
 
+----------------------------------------
+-- 通用词典加载函数（带缓存）
+function AuxFilter.load_dict_from_file(full_path)
+    if not AuxFilter.cache then
+        AuxFilter.cache = {}
+    end
+
+    if AuxFilter.cache[full_path] then
+        return AuxFilter.cache[full_path]
+    end
+
+    local file = io.open(full_path, "r")
+    if not file then
+        return nil
+    end
+
+    local auxCodes = {}
+    for line in file:lines() do
+        line = line:match("[^\r\n]+")          -- 去掉换行符
+        local key, value = line:match("([^=]+)=(.+)") -- 分割 key = value
+        if key and value then
+            if auxCodes[key] then
+                auxCodes[key] = auxCodes[key] .. " " .. value
+            else
+                auxCodes[key] = value
+            end
+        end
+    end
+    file:close()
+
+    AuxFilter.cache[full_path] = auxCodes
+    return auxCodes
+end
+
+-- 原有读取函数：基于目录+名字，现调用 load_dict_from_file 实现
+function AuxFilter.readAuxTxt(file_dir, dict_name)
+    local dict_filename = dict_name .. ".txt"
+    local file_absolute_path = file_dir .. dict_filename
+    local auxCodes = AuxFilter.load_dict_from_file(file_absolute_path)
+    if auxCodes then
+        return auxCodes, nil, dict_filename
+    else
+        return nil, file_absolute_path, dict_filename
+    end
+end
+
 function AuxFilter.init(env)
     -- log.info("** AuxCode filter", env.name_space)
     local shared_data_dir = rime_api.get_shared_data_dir() .. "/aux_code/"
     local user_data_dir = rime_api.get_user_data_dir() .. "/aux_code/"
-    local aux_code, missing_path, missing_file = AuxFilter.readAuxTxt(user_data_dir, env.name_space) -- 程序目录和用户目录都找一下，用户目录优先
-    if not aux_code then
-        aux_code, missing_path, missing_file = AuxFilter.readAuxTxt(shared_data_dir, env.name_space)
-    end
-    if aux_code then
-        AuxFilter.aux_code = aux_code
-        env.aux_ready = true
-        env.aux_error_msg = nil
-    else
-        AuxFilter.aux_code = {}
-        env.aux_ready = false
-        env.aux_error_msg = build_missing_dict_message(missing_file or (env.name_space .. ".txt"))
-        if log and log.warning then
-            log.warning("aux_code: dictionary load failed: " .. (missing_path or ""))
-        end
-    end
+    local aux_code, missing_path, missing_file
 
     local engine = env.engine
     local config = engine.schema.config
+
+    -- 从配置中读取自定义词典路径（相对 user_data_dir / shared_data_dir）
+    local custom_dict_path = config:get_string("aux_code/dict")
+    if custom_dict_path and custom_dict_path ~= "" then
+        -- 将反斜杠统一为正斜杠
+        custom_dict_path = custom_dict_path:gsub("\\", "/")
+        -- 先尝试 user_data_dir 下的路径
+        local user_full = rime_api.get_user_data_dir() .. "/" .. custom_dict_path
+        aux_code = AuxFilter.load_dict_from_file(user_full)
+        if not aux_code then
+            -- 再尝试 shared_data_dir 下的路径
+            local shared_full = rime_api.get_shared_data_dir() .. "/" .. custom_dict_path
+            aux_code = AuxFilter.load_dict_from_file(shared_full)
+        end
+        if aux_code then
+            AuxFilter.aux_code = aux_code
+            env.aux_ready = true
+            env.aux_error_msg = nil
+        else
+            AuxFilter.aux_code = {}
+            env.aux_ready = false
+            env.aux_error_msg = build_missing_dict_message(custom_dict_path)
+            if log and log.warning then
+                log.warning("aux_code: custom dict not found: " .. custom_dict_path)
+            end
+        end
+    else
+        -- 原有逻辑：尝试用户目录和共享目录下的 aux_code/ 子目录，文件名与 schema 同名
+        aux_code, missing_path, missing_file = AuxFilter.readAuxTxt(user_data_dir, env.name_space)
+        if not aux_code then
+            aux_code, missing_path, missing_file = AuxFilter.readAuxTxt(shared_data_dir, env.name_space)
+        end
+        if aux_code then
+            AuxFilter.aux_code = aux_code
+            env.aux_ready = true
+            env.aux_error_msg = nil
+        else
+            AuxFilter.aux_code = {}
+            env.aux_ready = false
+            env.aux_error_msg = build_missing_dict_message(missing_file or (env.name_space .. ".txt"))
+            if log and log.warning then
+                log.warning("aux_code: dictionary load failed: " .. (missing_path or ""))
+            end
+        end
+    end
 
     -- 双触发键：learn 与 no_learn
     env.learn_trigger = normalize_trigger(config:get_string("key_binder/aux_code_learn_trigger"), nil)
@@ -151,62 +227,6 @@ function AuxFilter.init(env)
         end
     end)
 end
-
-----------------
--- 閱讀輔碼文件 --
-----------------
-function AuxFilter.readAuxTxt(file_dir, dict_name)
-    local dict_filename = dict_name .. ".txt"
-    local file_absolute_path = file_dir .. dict_filename
-
-    if not AuxFilter.cache then
-        AuxFilter.cache = {}
-    end
-
-    if AuxFilter.cache[file_absolute_path] then
-        return AuxFilter.cache[file_absolute_path], nil, dict_filename
-    end
-
-    -- log.info("** AuxCode filter", 'read Aux code txt:', txtpath)
-
-    local file = io.open(file_absolute_path, "r")
-    if not file then
-        return nil, file_absolute_path, dict_filename
-    end
-
-    local auxCodes = {}
-    for line in file:lines() do
-        line = line:match("[^\r\n]+") -- 去掉換行符，不然 value 是帶著 \n 的
-        local key, value = line:match("([^=]+)=(.+)") -- 分割 = 左右的變數
-        if key and value then
-            if auxCodes[key] then
-                auxCodes[key] = auxCodes[key] .. " " .. value
-            else
-                auxCodes[key] = value
-            end
-        end
-    end
-    file:close()
-    -- 確認 code 能打印出來
-    -- for key, value in pairs(AuxFilter.aux_code) do
-    --     log.info(key, table.concat(value, ','))
-    -- end
-
-    AuxFilter.cache[file_absolute_path] = auxCodes
-    return auxCodes, nil, dict_filename
-end
-
--- local function getUtf8CharLength(byte)
---     if byte < 128 then
---         return 1
---     elseif byte < 224 then
---         return 2
---     elseif byte < 240 then
---         return 3
---     else
---         return 4
---     end
--- end
 
 -- 輔助函數，用於獲取表格的所有鍵
 local function table_keys(t)
